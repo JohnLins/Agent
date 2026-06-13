@@ -6,6 +6,9 @@ import threading
 import signal
 import boto3
 from dotenv import load_dotenv
+
+load_dotenv()
+
 # =========================
 # CONFIG
 # =========================
@@ -14,17 +17,12 @@ STATE_FILE = "state.json"
 INPUT_FILE = "input.txt"
 
 MODEL_V3 = "deepseek.v3.2"
-MODEL_R1 = "deepseek.r1-v1:0"
+# R1 is cross-region only; use the geo inference profile, not the raw model ID.
+MODEL_R1 = os.getenv("BEDROCK_R1_MODEL_ID", "us.deepseek.r1-v1:0")
 
 LOOP_SLEEP = 1.0
 MAX_RECENT_EVENTS = 25
 REFLECTION_INTERVAL = 10
-
-
-
-load_dotenv()
-
-
 
 bedrock = boto3.client(
     "bedrock-runtime",
@@ -90,42 +88,79 @@ def kill_current_job():
 # =========================
 
 def call_bedrock(model_id, prompt):
-    formatted_prompt = f"""
+    if "v3" in model_id:
+        body = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2048,
+            "temperature": 0.5,
+            "top_p": 0.9,
+        }
+    else:
+        formatted_prompt = f"""
 <｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜><think>
 """
-
-    body = {
-        "prompt": formatted_prompt,
-        "max_tokens": 2048,
-        "temperature": 0.5,
-        "top_p": 0.9
-    }
+        body = {
+            "prompt": formatted_prompt,
+            "max_tokens": 2048,
+            "temperature": 0.5,
+            "top_p": 0.9,
+        }
 
     response = bedrock.invoke_model(
         modelId=model_id,
-        body=json.dumps(body)
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body),
     )
 
-    raw = response["body"].read().decode("utf-8")
-    data = json.loads(raw)
-
-    # DeepSeek response format
-    return data["choices"][0]["text"]
+    data = json.loads(response["body"].read().decode("utf-8"))
+    choice = data["choices"][0]
+    if "message" in choice:
+        return choice["message"]["content"]
+    return choice["text"]
 
 # =========================
 # JSON PARSER
 # =========================
 
 def safe_json_load(text):
+    fallback = {
+        "thought": "parse_error",
+        "plan": "",
+        "current_task": "",
+        "actions": [],
+        "goal_complete": False,
+    }
+    if not text or not isinstance(text, str):
+        return fallback
+
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
     try:
         return json.loads(text)
-    except:
-        return {
-            "thought": "parse_error",
-            "plan": "",
-            "current_task": "",
-            "actions": []
-        }
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    return fallback
+
+
+def is_goal_complete(result):
+    return result.get("goal_complete") in (True, "true", "True", 1)
 
 # =========================
 # PROMPT BUILDER
@@ -161,6 +196,7 @@ Return ONLY valid JSON:
   "thought": "...",
   "plan": "...",
   "current_task": "...",
+  "goal_complete": false,
   "actions": [
     {{
       "type": "bash",
@@ -169,6 +205,11 @@ Return ONLY valid JSON:
   ],
   "summary_update": "..."
 }}
+
+Rules:
+- When the goal is fully satisfied, set "goal_complete": true and "actions": [].
+- Do not run further actions after the goal is done.
+- If recent events already show success, mark goal_complete true instead of repeating work.
 
 If you output invalid JSON, the system will fail.
 """
@@ -301,6 +342,18 @@ def main():
         state["pending_human"] = []
 
         # -------------------------
+        # GOAL COMPLETION CHECK
+        # -------------------------
+        if is_goal_complete(result):
+            print("Goal complete.")
+            state["goal"] = None
+            state["plan"] = ""
+            state["task"] = ""
+            state["pending_human"] = []
+            save_state(state)
+            continue
+
+        # -------------------------
         # EXECUTE
         # -------------------------
         actions = result.get("actions", [])
@@ -312,18 +365,6 @@ def main():
         if len(state["recent_events"]) > 100:
             state["summary"] += "\n" + str(state["recent_events"][:50])
             state["recent_events"] = state["recent_events"][-50:]
-
-        # -------------------------
-        # GOAL COMPLETION CHECK
-        # -------------------------
-        if "goal_complete" in result and result["goal_complete"]:
-            print("Goal complete.")
-            state["goal"] = None
-            state["plan"] = ""
-            state["task"] = ""
-            state["pending_human"] = []
-            save_state(state)
-            continue
 
         save_state(state)
         time.sleep(LOOP_SLEEP)
