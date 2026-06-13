@@ -90,14 +90,27 @@ def kill_current_job():
 # =========================
 
 def call_bedrock(model_id, prompt):
+    formatted_prompt = f"""
+<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜><think>
+"""
+
+    body = {
+        "prompt": formatted_prompt,
+        "max_tokens": 2048,
+        "temperature": 0.5,
+        "top_p": 0.9
+    }
+
     response = bedrock.invoke_model(
         modelId=model_id,
-        body=json.dumps({
-            "inputText": prompt
-        })
+        body=json.dumps(body)
     )
-    output = json.loads(response["body"].read())
-    return output["outputText"]
+
+    raw = response["body"].read().decode("utf-8")
+    data = json.loads(raw)
+
+    # DeepSeek response format
+    return data["choices"][0]["text"]
 
 # =========================
 # JSON PARSER
@@ -156,6 +169,8 @@ Return ONLY valid JSON:
   ],
   "summary_update": "..."
 }}
+
+If you output invalid JSON, the system will fail.
 """
 
 # =========================
